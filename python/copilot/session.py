@@ -59,7 +59,8 @@ class CopilotSession:
         Args:
             session_id: The unique identifier for this session.
             client: The internal client connection to the Copilot CLI.
-            workspace_path: Path to the session workspace directory (when infinite sessions enabled).
+            workspace_path: Path to the session workspace directory
+                (when infinite sessions enabled).
         """
         self.session_id = session_id
         self._client = client
