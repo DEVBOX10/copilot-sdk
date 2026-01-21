@@ -15,6 +15,7 @@ export type {
     ConnectionState,
     CopilotClientOptions,
     CustomAgentConfig,
+    InfiniteSessionConfig,
     MCPLocalServerConfig,
     MCPRemoteServerConfig,
     MCPServerConfig,
