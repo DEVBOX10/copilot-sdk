@@ -5,9 +5,7 @@ import { createSdkTestContext } from "./harness/sdkTestContext.js";
 describe("Compaction", async () => {
     const { copilotClient: client } = await createSdkTestContext();
 
-    // Skip in CI - compaction requires real API calls to trigger token counting
-    // The replay proxy doesn't provide realistic token counts needed for compaction
-    it.skipIf(process.env.CI === "true")(
+    it(
         "should trigger compaction with low threshold and emit events",
         async () => {
             // Create session with very low compaction thresholds to trigger compaction quickly
