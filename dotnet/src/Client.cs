@@ -49,7 +49,7 @@ namespace GitHub.Copilot.SDK;
 /// await session.SendAsync(new MessageOptions { Prompt = "Hello!" });
 /// </code>
 /// </example>
-public class CopilotClient : IDisposable, IAsyncDisposable
+public partial class CopilotClient : IDisposable, IAsyncDisposable
 {
     private readonly ConcurrentDictionary<string, CopilotSession> _sessions = new();
     private readonly CopilotClientOptions _options;
@@ -462,7 +462,51 @@ public class CopilotClient : IDisposable, IAsyncDisposable
         var connection = await EnsureConnectedAsync(cancellationToken);
 
         return await connection.Rpc.InvokeWithCancellationAsync<PingResponse>(
-            "ping", [new { message }], cancellationToken);
+            "ping", [new PingRequest { Message = message }], cancellationToken);
+    }
+
+    /// <summary>
+    /// Gets CLI status including version and protocol information.
+    /// </summary>
+    /// <param name="cancellationToken">A <see cref="CancellationToken"/> that can be used to cancel the operation.</param>
+    /// <returns>A task that resolves with the status response containing version and protocol version.</returns>
+    /// <exception cref="InvalidOperationException">Thrown when the client is not connected.</exception>
+    public async Task<GetStatusResponse> GetStatusAsync(CancellationToken cancellationToken = default)
+    {
+        var connection = await EnsureConnectedAsync(cancellationToken);
+
+        return await connection.Rpc.InvokeWithCancellationAsync<GetStatusResponse>(
+            "status.get", [], cancellationToken);
+    }
+
+    /// <summary>
+    /// Gets current authentication status.
+    /// </summary>
+    /// <param name="cancellationToken">A <see cref="CancellationToken"/> that can be used to cancel the operation.</param>
+    /// <returns>A task that resolves with the authentication status.</returns>
+    /// <exception cref="InvalidOperationException">Thrown when the client is not connected.</exception>
+    public async Task<GetAuthStatusResponse> GetAuthStatusAsync(CancellationToken cancellationToken = default)
+    {
+        var connection = await EnsureConnectedAsync(cancellationToken);
+
+        return await connection.Rpc.InvokeWithCancellationAsync<GetAuthStatusResponse>(
+            "auth.getStatus", [], cancellationToken);
+    }
+
+    /// <summary>
+    /// Lists available models with their metadata.
+    /// </summary>
+    /// <param name="cancellationToken">A <see cref="CancellationToken"/> that can be used to cancel the operation.</param>
+    /// <returns>A task that resolves with a list of available models.</returns>
+    /// <exception cref="InvalidOperationException">Thrown when the client is not connected or not authenticated.</exception>
+    public async Task<List<ModelInfo>> ListModelsAsync(CancellationToken cancellationToken = default)
+    {
+        var connection = await EnsureConnectedAsync(cancellationToken);
+
+        var response = await connection.Rpc.InvokeWithCancellationAsync<GetModelsResponse>(
+            "models.list", [], cancellationToken);
+
+        return response.Models;
     }
 
     /// <summary>
@@ -511,7 +555,7 @@ public class CopilotClient : IDisposable, IAsyncDisposable
         var connection = await EnsureConnectedAsync(cancellationToken);
 
         var response = await connection.Rpc.InvokeWithCancellationAsync<DeleteSessionResponse>(
-            "session.delete", [new { sessionId }], cancellationToken);
+            "session.delete", [new DeleteSessionRequest(sessionId)], cancellationToken);
 
         if (!response.Success)
         {
@@ -561,7 +605,7 @@ public class CopilotClient : IDisposable, IAsyncDisposable
     {
         var expectedVersion = SdkProtocolVersion.GetVersion();
         var pingResponse = await connection.Rpc.InvokeWithCancellationAsync<PingResponse>(
-            "ping", [new { message = (string?)null }], cancellationToken);
+            "ping", [new PingRequest()], cancellationToken);
 
         if (!pingResponse.ProtocolVersion.HasValue)
         {
@@ -711,15 +755,30 @@ public class CopilotClient : IDisposable, IAsyncDisposable
             outputStream = networkStream;
         }
 
-        var rpc = new JsonRpc(new HeaderDelimitedMessageHandler(outputStream, inputStream, CreateFormatter()));
-        rpc.AddLocalRpcTarget(new RpcHandler(this));
+        var rpc = new JsonRpc(new HeaderDelimitedMessageHandler(
+            outputStream,
+            inputStream,
+            CreateSystemTextJsonFormatter()))
+        {
+            TraceSource = new LoggerTraceSource(_logger),
+        };
+
+        var handler = new RpcHandler(this);
+        rpc.AddLocalRpcMethod("session.event", handler.OnSessionEvent);
+        rpc.AddLocalRpcMethod("tool.call", handler.OnToolCall);
+        rpc.AddLocalRpcMethod("permission.request", handler.OnPermissionRequest);
         rpc.StartListening();
         return new Connection(rpc, cliProcess, tcpClient, networkStream);
     }
 
-    [UnconditionalSuppressMessage("Trimming", "IL2026", Justification = "Using the Json source generator.")]
-    [UnconditionalSuppressMessage("AOT", "IL3050", Justification = "Using the Json source generator.")]
-    static IJsonRpcMessageFormatter CreateFormatter()
+    [UnconditionalSuppressMessage("Trimming", "IL2026", Justification = "Using happy path from https://microsoft.github.io/vs-streamjsonrpc/docs/nativeAOT.html")]
+    [UnconditionalSuppressMessage("AOT", "IL3050", Justification = "Using happy path from https://microsoft.github.io/vs-streamjsonrpc/docs/nativeAOT.html")]
+    private static SystemTextJsonFormatter CreateSystemTextJsonFormatter() =>
+        new SystemTextJsonFormatter() { JsonSerializerOptions = SerializerOptionsForMessageFormatter };
+
+    private static JsonSerializerOptions SerializerOptionsForMessageFormatter { get; } = CreateSerializerOptions();
+
+    private static JsonSerializerOptions CreateSerializerOptions()
     {
         var options = new JsonSerializerOptions(JsonSerializerDefaults.Web)
         {
@@ -727,7 +786,14 @@ public class CopilotClient : IDisposable, IAsyncDisposable
             DefaultIgnoreCondition = JsonIgnoreCondition.WhenWritingNull
         };
 
-        return new SystemTextJsonFormatter() { JsonSerializerOptions = options };
+        options.TypeInfoResolverChain.Add(ClientJsonContext.Default);
+        options.TypeInfoResolverChain.Add(TypesJsonContext.Default);
+        options.TypeInfoResolverChain.Add(CopilotSession.SessionJsonContext.Default);
+        options.TypeInfoResolverChain.Add(SessionEventsJsonContext.Default);
+
+        options.MakeReadOnly();
+
+        return options;
     }
 
     internal CopilotSession? GetSession(string sessionId) =>
@@ -760,9 +826,7 @@ public class CopilotClient : IDisposable, IAsyncDisposable
 
     private class RpcHandler(CopilotClient client)
     {
-        [JsonRpcMethod("session.event")]
-        public void OnSessionEvent(string sessionId,
-            JsonElement? @event)
+        public void OnSessionEvent(string sessionId, JsonElement? @event)
         {
             var session = client.GetSession(sessionId);
             if (session != null && @event != null)
@@ -775,7 +839,6 @@ public class CopilotClient : IDisposable, IAsyncDisposable
             }
         }
 
-        [JsonRpcMethod("tool.call")]
         public async Task<ToolCallResponse> OnToolCall(string sessionId,
             string toolCallId,
             string toolName,
@@ -848,7 +911,7 @@ public class CopilotClient : IDisposable, IAsyncDisposable
                     // something we don't control? an error?)
                     TextResultForLlm = result is JsonElement { ValueKind: JsonValueKind.String } je
                         ? je.GetString()!
-                        : JsonSerializer.Serialize(result, tool.JsonSerializerOptions),
+                        : JsonSerializer.Serialize(result, tool.JsonSerializerOptions.GetTypeInfo(typeof(object))),
                 };
                 return new ToolCallResponse(toolResultObject);
             }
@@ -865,7 +928,6 @@ public class CopilotClient : IDisposable, IAsyncDisposable
             }
         }
 
-        [JsonRpcMethod("permission.request")]
         public async Task<PermissionRequestResponse> OnPermissionRequest(string sessionId, JsonElement permissionRequest)
         {
             var session = client.GetSession(sessionId);
@@ -916,7 +978,7 @@ public class CopilotClient : IDisposable, IAsyncDisposable
     }
 
     // Request/Response types for RPC
-    private record CreateSessionRequest(
+    internal record CreateSessionRequest(
         string? Model,
         string? SessionId,
         List<ToolDefinition>? Tools,
@@ -933,7 +995,7 @@ public class CopilotClient : IDisposable, IAsyncDisposable
         List<string>? DisabledSkills,
         InfiniteSessionConfig? InfiniteSessions);
 
-    private record ToolDefinition(
+    internal record ToolDefinition(
         string Name,
         string? Description,
         JsonElement Parameters /* JSON schema */)
@@ -945,8 +1007,9 @@ public class CopilotClient : IDisposable, IAsyncDisposable
     private record CreateSessionResponse(
         string SessionId,
         string? WorkspacePath);
+        string SessionId);
 
-    private record ResumeSessionRequest(
+    internal record ResumeSessionRequest(
         string SessionId,
         List<ToolDefinition>? Tools,
         ProviderConfig? Provider,
@@ -960,22 +1023,92 @@ public class CopilotClient : IDisposable, IAsyncDisposable
     private record ResumeSessionResponse(
         string SessionId,
         string? WorkspacePath);
+        string SessionId);
 
-    private record GetLastSessionIdResponse(
+    internal record GetLastSessionIdResponse(
         string? SessionId);
 
-    private record DeleteSessionResponse(
+    internal record DeleteSessionRequest(
+        string SessionId);
+
+    internal record DeleteSessionResponse(
         bool Success,
         string? Error);
 
-    private record ListSessionsResponse(
+    internal record ListSessionsResponse(
         List<SessionMetadata> Sessions);
 
-    private record ToolCallResponse(
+    internal record ToolCallResponse(
         ToolResultObject? Result);
 
-    private record PermissionRequestResponse(
+    internal record PermissionRequestResponse(
         PermissionRequestResult Result);
+
+    /// <summary>Trace source that forwards all logs to the ILogger.</summary>
+    internal sealed class LoggerTraceSource : TraceSource
+    {
+        public LoggerTraceSource(ILogger logger) : base(nameof(LoggerTraceSource), SourceLevels.All)
+        {
+            Listeners.Clear();
+            Listeners.Add(new LoggerTraceListener(logger));
+        }
+
+        private sealed class LoggerTraceListener(ILogger logger) : TraceListener
+        {
+            public override void TraceEvent(TraceEventCache? eventCache, string source, TraceEventType eventType, int id, string? message) =>
+                logger.Log(MapLevel(eventType), "[{Source}] {Message}", source, message);
+
+            public override void TraceEvent(TraceEventCache? eventCache, string source, TraceEventType eventType, int id, string? format, params object?[]? args) =>
+                logger.Log(MapLevel(eventType), "[{Source}] {Message}", source, args is null || args.Length == 0 ? format : string.Format(format ?? "", args));
+
+            public override void TraceData(TraceEventCache? eventCache, string source, TraceEventType eventType, int id, object? data) =>
+                logger.Log(MapLevel(eventType), "[{Source}] {Data}", source, data);
+
+            public override void TraceData(TraceEventCache? eventCache, string source, TraceEventType eventType, int id, params object?[]? data) =>
+                logger.Log(MapLevel(eventType), "[{Source}] {Data}", source, data is null ? null : string.Join(", ", data));
+
+            public override void Write(string? message) =>
+                logger.LogTrace("{Message}", message);
+
+            public override void WriteLine(string? message) =>
+                logger.LogTrace("{Message}", message);
+
+            private static LogLevel MapLevel(TraceEventType eventType) => eventType switch
+            {
+                TraceEventType.Critical => LogLevel.Critical,
+                TraceEventType.Error => LogLevel.Error,
+                TraceEventType.Warning => LogLevel.Warning,
+                TraceEventType.Information => LogLevel.Information,
+                TraceEventType.Verbose => LogLevel.Debug,
+                _ => LogLevel.Trace
+            };
+        }
+    }
+
+    [JsonSourceGenerationOptions(
+        JsonSerializerDefaults.Web,
+        AllowOutOfOrderMetadataProperties = true,
+        NumberHandling = JsonNumberHandling.AllowReadingFromString,
+        DefaultIgnoreCondition = JsonIgnoreCondition.WhenWritingNull)]
+    [JsonSerializable(typeof(CreateSessionRequest))]
+    [JsonSerializable(typeof(CreateSessionResponse))]
+    [JsonSerializable(typeof(CustomAgentConfig))]
+    [JsonSerializable(typeof(DeleteSessionRequest))]
+    [JsonSerializable(typeof(DeleteSessionResponse))]
+    [JsonSerializable(typeof(GetLastSessionIdResponse))]
+    [JsonSerializable(typeof(ListSessionsResponse))]
+    [JsonSerializable(typeof(PermissionRequestResponse))]
+    [JsonSerializable(typeof(PermissionRequestResult))]
+    [JsonSerializable(typeof(ProviderConfig))]
+    [JsonSerializable(typeof(ResumeSessionRequest))]
+    [JsonSerializable(typeof(ResumeSessionResponse))]
+    [JsonSerializable(typeof(SessionMetadata))]
+    [JsonSerializable(typeof(SystemMessageConfig))]
+    [JsonSerializable(typeof(ToolCallResponse))]
+    [JsonSerializable(typeof(ToolDefinition))]
+    [JsonSerializable(typeof(ToolResultAIContent))]
+    [JsonSerializable(typeof(ToolResultObject))]
+    internal partial class ClientJsonContext : JsonSerializerContext;
 }
 
 // Must inherit from AIContent as a signal to MEAI to avoid JSON-serializing the
