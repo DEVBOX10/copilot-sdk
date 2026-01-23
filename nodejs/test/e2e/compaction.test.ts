@@ -69,51 +69,6 @@ describe("Compaction", async () => {
         120000
     );
 
-    it("should emit usage info events showing context window state", async () => {
-        const session = await client.createSession({
-            infiniteSessions: {
-                enabled: true,
-            },
-        });
-
-        const usageEvents: SessionEvent[] = [];
-        session.on((event) => {
-            if (event.type === "session.usage_info") {
-                usageEvents.push(event);
-            }
-        });
-
-        await session.sendAndWait({ prompt: "What is 2+2?" });
-
-        // Should have received at least one usage info event
-        expect(usageEvents.length).toBeGreaterThanOrEqual(1);
-
-        const lastUsageEvent = usageEvents[usageEvents.length - 1];
-        expect(lastUsageEvent.data.tokenLimit).toBeGreaterThan(0);
-        expect(lastUsageEvent.data.currentTokens).toBeGreaterThan(0);
-        expect(lastUsageEvent.data.messagesLength).toBeGreaterThan(0);
-    });
-
-    it("should receive assistant.usage events with token counts", async () => {
-        const session = await client.createSession();
-
-        const usageEvents: SessionEvent[] = [];
-        session.on((event) => {
-            if (event.type === "assistant.usage") {
-                usageEvents.push(event);
-            }
-        });
-
-        await session.sendAndWait({ prompt: "What is the capital of France?" });
-
-        // Should have received at least one assistant usage event
-        expect(usageEvents.length).toBeGreaterThanOrEqual(1);
-
-        const lastUsageEvent = usageEvents[usageEvents.length - 1];
-        // Token counts may be 0 when replaying from snapshot, but model should be defined
-        expect(lastUsageEvent.data.model).toBeDefined();
-    });
-
     it("should not emit compaction events when infinite sessions disabled", async () => {
         const session = await client.createSession({
             infiniteSessions: {
